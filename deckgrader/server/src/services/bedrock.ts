@@ -189,7 +189,71 @@ function parseReport(raw: string): GradeReport | null {
   }
 }
 
+/**
+ * Dev-only mock (DECKGRADER_MOCK_BEDROCK=1): a deterministic heuristic report
+ * derived from parser signals, for exercising the full pipeline and UI without
+ * AWS credentials. Real grading always goes through Bedrock.
+ */
+function mockReport(deck: ParsedDeck): GradeReport {
+  const isActionTitle = (t: string | null): boolean =>
+    !!t && t.split(/\s+/).length >= 6 && /[a-z]/.test(t);
+  const actionTitleRatio =
+    deck.slides.filter((s) => isActionTitle(s.title)).length / deck.slideCount;
+  const wallOfTextCount = deck.slides.filter((s) => s.wordCount > 120).length;
+  const deepBullets = deck.slides.filter((s) => s.bulletDepthMax > 2).length;
+  const lastTitle = deck.slides[deck.slides.length - 1]?.title ?? '';
+  const endsWithRecommendation = /recommend|next step|decision|ask|proposal/i.test(lastTitle);
+  const clamp = (n: number) => Math.max(5, Math.min(97, Math.round(n)));
+
+  const storyline = clamp(25 + actionTitleRatio * 60 + (endsWithRecommendation ? 10 : 0));
+  const titles = clamp(15 + actionTitleRatio * 80);
+  const evidence = clamp(30 + actionTitleRatio * 45);
+  const craft = clamp(
+    90 - (wallOfTextCount / deck.slideCount) * 60 - (deepBullets / deck.slideCount) * 30,
+  );
+  const audience = clamp(endsWithRecommendation ? 85 : 25);
+  const overall = Math.round(
+    storyline * 0.3 + titles * 0.25 + evidence * 0.2 + craft * 0.15 + audience * 0.1,
+  );
+  const grade =
+    overall >= 88 ? 'A' : overall >= 75 ? 'B' : overall >= 60 ? 'C' : overall >= 45 ? 'D' : 'F';
+
+  return {
+    overallScore: overall,
+    grade,
+    categoryScores: [
+      { category: 'Storyline & Structure', score: storyline, summary: '[mock] Scored from title signals.' },
+      { category: 'Action Titles & So-What', score: titles, summary: '[mock] Scored from action-title ratio.' },
+      { category: 'Evidence & Data Integrity', score: evidence, summary: '[mock] Heuristic estimate.' },
+      { category: 'Visual Hierarchy & Slide Craft', score: craft, summary: '[mock] Scored from word counts and bullet depth.' },
+      { category: 'Audience & Recommendation Fit', score: audience, summary: '[mock] Scored from closing slide.' },
+    ],
+    topStrengths: ['[mock] Deterministic development report — set AWS credentials for real grading.'],
+    criticalIssues: deck.slides
+      .filter((s) => !isActionTitle(s.title) || s.wordCount > 120)
+      .slice(0, 5)
+      .map((s) => `[mock] Slide ${s.index}: ${!isActionTitle(s.title) ? 'label title' : 'wall of text'}.`),
+    slideFeedback: deck.slides.map((s) => ({
+      slideIndex: s.index,
+      issues: [
+        ...(!isActionTitle(s.title) ? ['Title is a label, not a claim.'] : []),
+        ...(s.wordCount > 120 ? [`${s.wordCount} words — over the ~100-word guideline.`] : []),
+        ...(s.bulletDepthMax > 2 ? [`Bullets nested ${s.bulletDepthMax} levels deep.`] : []),
+      ],
+      rewrittenTitle: isActionTitle(s.title) ? null : `[mock rewrite] Slide ${s.index} needs a full-sentence claim`,
+      fix: '[mock] Rewrite the title as a quantified claim and cut body text to what proves it.',
+    })),
+    storylineRewrite: deck.slides.map(
+      (s) => (isActionTitle(s.title) ? s.title! : `[mock] Replace "${s.title ?? 'untitled'}" with an action title`),
+    ),
+  };
+}
+
 export async function gradeDeck(deck: ParsedDeck): Promise<GradeReport> {
+  if (process.env.DECKGRADER_MOCK_BEDROCK === '1') {
+    return mockReport(deck);
+  }
+
   const system = buildSystemPrompt();
   const deckJson = JSON.stringify(prepareDeckForPrompt(deck));
   const messages: BedrockMessage[] = [
