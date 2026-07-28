@@ -34,3 +34,42 @@ export function gradeDeck(file: File, onUploaded: () => void): Promise<GradeResp
     xhr.send(form);
   });
 }
+
+async function fetchDeckFile(url: string, body: unknown): Promise<Blob> {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    let message = `Request failed (${res.status}).`;
+    try {
+      const data = (await res.json()) as { message?: string };
+      if (typeof data.message === 'string') message = data.message;
+    } catch {
+      // non-JSON error body; keep generic message
+    }
+    throw new ApiError(message);
+  }
+  return res.blob();
+}
+
+/** Trigger a browser download of a generated .pptx blob. */
+export function downloadBlob(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+/** Rebuild the graded deck with the report's fixes applied. */
+export function fixDeck(gradeId: string): Promise<Blob> {
+  return fetchDeckFile('/api/fix', { gradeId });
+}
+
+/** Create a consulting-standard deck from a plain-text brief. */
+export function generateFromBrief(brief: string): Promise<Blob> {
+  return fetchDeckFile('/api/generate', { brief });
+}

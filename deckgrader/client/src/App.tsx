@@ -89,7 +89,10 @@ export default function App() {
             </section>
           )}
 
-          <StorylinePanel storyline={state.result.report.storylineRewrite} />
+          <StorylinePanel
+            storyline={state.result.report.storylineRewrite}
+            gradeId={state.result.gradeId}
+          />
 
           {state.result.report.criticalIssues.length > 0 && (
             <section className="rounded-xl border border-red-900/50 bg-red-950/20 p-6">

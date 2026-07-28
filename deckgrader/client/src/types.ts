@@ -29,6 +29,7 @@ export interface DeckStats {
 }
 
 export interface GradeResponse {
+  gradeId: string;
   deckStats: DeckStats;
   slideCount: number;
   report: GradeReport;

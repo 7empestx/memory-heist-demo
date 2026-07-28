@@ -1,11 +1,18 @@
-import { Router, type Request, type Response } from 'express';
+import { Router, json, type Request, type Response } from 'express';
 import multer from 'multer';
 import { mkdir, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { parseDeck, ParseError } from '../services/parser.js';
-import { gradeDeck, GradingError } from '../services/bedrock.js';
+import { parseDeck, ParseError, type ParsedDeck } from '../services/parser.js';
+import {
+  gradeDeck,
+  generateFixedDeckSpec,
+  generateDeckSpecFromBrief,
+  GradingError,
+  type GradeReport,
+} from '../services/bedrock.js';
+import { buildDeck, BuildError } from '../services/builder.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UPLOAD_DIR = path.resolve(__dirname, '../../tmp/uploads');
@@ -26,6 +33,23 @@ function rateLimited(ip: string): boolean {
   recent.push(now);
   requestLog.set(ip, recent);
   return false;
+}
+
+// Short-lived in-memory store of grade results so /api/fix can rebuild the deck
+// without the client re-uploading it. Content stays server-side and expires.
+const GRADE_TTL_MS = 15 * 60 * 1000;
+interface CachedGrade {
+  deck: ParsedDeck;
+  report: GradeReport;
+  expires: number;
+}
+const gradeCache = new Map<string, CachedGrade>();
+
+function sweepGradeCache(): void {
+  const now = Date.now();
+  for (const [id, entry] of gradeCache) {
+    if (entry.expires < now) gradeCache.delete(id);
+  }
 }
 
 const storage = multer.diskStorage({
@@ -92,7 +116,12 @@ gradeRouter.post('/grade', (req: Request, res: Response) => {
       }
 
       const report = await gradeDeck(deck);
-      res.json({ deckStats: deck.deckStats, slideCount: deck.slideCount, report });
+
+      sweepGradeCache();
+      const gradeId = randomUUID();
+      gradeCache.set(gradeId, { deck, report, expires: Date.now() + GRADE_TTL_MS });
+
+      res.json({ gradeId, deckStats: deck.deckStats, slideCount: deck.slideCount, report });
     } catch (err) {
       if (err instanceof ParseError) {
         const status = err.kind === 'bad_file' ? 400 : 422;
@@ -109,4 +138,87 @@ gradeRouter.post('/grade', (req: Request, res: Response) => {
       await unlink(file.path).catch(() => {});
     }
   });
+});
+
+async function sendBuiltDeck(res: Response, filePath: string, filename: string): Promise<void> {
+  try {
+    await new Promise<void>((resolve, reject) => {
+      res.download(filePath, filename, (err) => (err ? reject(err) : resolve()));
+    });
+  } finally {
+    await unlink(filePath).catch(() => {});
+  }
+}
+
+function sendCreationError(res: Response, err: unknown): void {
+  if (err instanceof GradingError) {
+    res.status(502).json({
+      message: 'The deck generation service is unavailable right now. Please try again in a minute.',
+    });
+  } else if (err instanceof BuildError) {
+    res.status(500).json({ message: err.message });
+  } else {
+    res.status(500).json({ message: 'Something went wrong. Please try again.' });
+  }
+}
+
+/** Rebuild a previously graded deck with the report's fixes applied. */
+gradeRouter.post('/fix', json(), async (req: Request, res: Response) => {
+  const ip = req.ip ?? 'unknown';
+  if (rateLimited(ip)) {
+    res.status(429).json({ message: 'Rate limit reached: 10 requests per hour. Try again later.' });
+    return;
+  }
+
+  const gradeId = (req.body as { gradeId?: unknown } | undefined)?.gradeId;
+  if (typeof gradeId !== 'string') {
+    res.status(400).json({ message: 'Missing gradeId.' });
+    return;
+  }
+
+  sweepGradeCache();
+  const cached = gradeCache.get(gradeId);
+  if (!cached) {
+    res.status(410).json({
+      message: 'This grade has expired. Re-grade the deck, then download the fixed version.',
+    });
+    return;
+  }
+
+  try {
+    const spec = await generateFixedDeckSpec(cached.deck, cached.report);
+    const filePath = await buildDeck(spec);
+    await sendBuiltDeck(res, filePath, 'fixed-deck.pptx');
+  } catch (err) {
+    if (!res.headersSent) sendCreationError(res, err);
+  }
+});
+
+/** Create a consulting-standard deck from a plain-text brief. */
+gradeRouter.post('/generate', json(), async (req: Request, res: Response) => {
+  const ip = req.ip ?? 'unknown';
+  if (rateLimited(ip)) {
+    res.status(429).json({ message: 'Rate limit reached: 10 requests per hour. Try again later.' });
+    return;
+  }
+
+  const brief = (req.body as { brief?: unknown } | undefined)?.brief;
+  if (typeof brief !== 'string' || brief.trim().split(/\s+/).length < 5) {
+    res.status(400).json({
+      message: 'Provide a brief of at least a few sentences: the situation, the audience, and the decision the deck should drive.',
+    });
+    return;
+  }
+  if (brief.length > 8000) {
+    res.status(400).json({ message: 'Brief is too long — keep it under 8,000 characters.' });
+    return;
+  }
+
+  try {
+    const spec = await generateDeckSpecFromBrief(brief.trim());
+    const filePath = await buildDeck(spec);
+    await sendBuiltDeck(res, filePath, 'deckgrader-deck.pptx');
+  } catch (err) {
+    if (!res.headersSent) sendCreationError(res, err);
+  }
 });

@@ -40,6 +40,23 @@ export interface GradeReport {
   storylineRewrite: string[];
 }
 
+export interface SpecBullet {
+  text: string;
+  level: number;
+}
+
+export interface SpecSlide {
+  title: string;
+  bullets: SpecBullet[];
+  notes: string | null;
+}
+
+export interface DeckSpec {
+  deckTitle: string;
+  subtitle: string | null;
+  slides: SpecSlide[];
+}
+
 export class GradingError extends Error {
   constructor(
     message: string,
@@ -278,4 +295,162 @@ export async function gradeDeck(deck: ParsedDeck): Promise<GradeReport> {
   if (report) return report;
 
   throw new GradingError('Model did not return a valid grading report.', 'bad_model_output');
+}
+
+// ---------------------------------------------------------------------------
+// Deck creation: turn a graded deck (or a brief) into a slide spec that
+// scripts/build_deck.py can render. Same model, same module, so it stays
+// swappable behind this file.
+// ---------------------------------------------------------------------------
+
+const SPEC_SCHEMA_HINT = JSON.stringify({
+  deckTitle: 'string — the deck’s governing thought as a title',
+  subtitle: 'string naming the audience and the decision requested, or null',
+  slides: [
+    {
+      title: 'full-sentence action title (a claim, not a label)',
+      bullets: [{ text: 'evidence or support that proves the title', level: 0 }],
+      notes: 'optional speaker notes or null',
+    },
+  ],
+});
+
+const SPEC_RULES = [
+  'Rules for the spec: every title is a full-sentence, falsifiable claim; titles read in order must tell',
+  'the complete story ending in an explicit recommendation/next-steps slide (owners and dates where known);',
+  'one idea per slide; max 5 bullets per slide, max 2 bullet levels (level 0 or 1), <= ~80 words per slide;',
+  'keep specific numbers from the source material — never replace them with vague quantifiers;',
+  'cite sources in a bullet where the source material provides them.',
+  'Respond with ONLY the JSON spec object — no markdown fences, no commentary.',
+].join('\n');
+
+function buildSpecSystemPrompt(): string {
+  return [
+    'You are DeckGrader, an expert presentation writer trained on McKinsey, BCG, and Bain deck standards.',
+    'You produce slide specifications that follow the rubric below.',
+    '',
+    '# Rubric',
+    serializeRubricForPrompt(),
+    '# Output',
+    'Schema:',
+    SPEC_SCHEMA_HINT,
+    '',
+    SPEC_RULES,
+  ].join('\n');
+}
+
+function isDeckSpec(value: unknown): value is DeckSpec {
+  if (typeof value !== 'object' || value === null) return false;
+  const s = value as Record<string, unknown>;
+  return (
+    typeof s.deckTitle === 'string' &&
+    s.deckTitle.length > 0 &&
+    Array.isArray(s.slides) &&
+    s.slides.length > 0 &&
+    s.slides.every(
+      (slide) =>
+        typeof slide === 'object' &&
+        slide !== null &&
+        typeof (slide as Record<string, unknown>).title === 'string' &&
+        Array.isArray((slide as Record<string, unknown>).bullets),
+    )
+  );
+}
+
+function parseSpec(raw: string): DeckSpec | null {
+  try {
+    const parsed: unknown = JSON.parse(stripCodeFences(raw));
+    return isDeckSpec(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+async function generateSpec(userMessage: string): Promise<DeckSpec> {
+  const system = buildSpecSystemPrompt();
+  const messages: BedrockMessage[] = [{ role: 'user', content: userMessage }];
+
+  const firstAttempt = await invokeModel(system, messages);
+  let spec = parseSpec(firstAttempt);
+  if (spec) return spec;
+
+  const retry = await invokeModel(system, [
+    ...messages,
+    { role: 'assistant', content: firstAttempt },
+    {
+      role: 'user',
+      content:
+        'Your previous response was not valid JSON matching the required spec schema. Return ONLY the valid JSON spec object now — no markdown fences, no commentary.',
+    },
+  ]);
+  spec = parseSpec(retry);
+  if (spec) return spec;
+
+  throw new GradingError('Model did not return a valid deck spec.', 'bad_model_output');
+}
+
+/** Dev-only mock spec: fixed storyline titles over condensed original body text. */
+function mockFixedSpec(deck: ParsedDeck, report: GradeReport): DeckSpec {
+  const titles =
+    report.storylineRewrite.length > 0
+      ? report.storylineRewrite
+      : deck.slides.map((s) => s.title ?? 'Untitled');
+  return {
+    deckTitle: '[mock] Fixed deck — set AWS credentials for real generation',
+    subtitle: 'Rebuilt by DeckGrader (mock mode)',
+    slides: titles.map((title, i) => {
+      const source = deck.slides[Math.min(i, deck.slides.length - 1)];
+      return {
+        title,
+        bullets: (source?.bodyText ?? [])
+          .slice(0, 4)
+          .map((text) => ({ text: text.split(/\s+/).slice(0, 20).join(' '), level: 0 })),
+        notes: null,
+      };
+    }),
+  };
+}
+
+/** Rebuild a graded deck to consulting standards: the report's fixes, applied. */
+export async function generateFixedDeckSpec(
+  deck: ParsedDeck,
+  report: GradeReport,
+): Promise<DeckSpec> {
+  if (process.env.DECKGRADER_MOCK_BEDROCK === '1') {
+    return mockFixedSpec(deck, report);
+  }
+  const payload = JSON.stringify({ originalDeck: prepareDeckForPrompt(deck), gradeReport: report });
+  return generateSpec(
+    'Rebuild this deck so it would score an A against the rubric. Use the grade report’s storylineRewrite ' +
+      'as the backbone of the new slide order and titles, keep all real data and sources from the original ' +
+      'slides, condense body text to the evidence that proves each title, and end with an explicit ' +
+      `recommendation slide.\n${payload}`,
+  );
+}
+
+/** Create a consulting-standard deck spec from a plain-text brief. */
+export async function generateDeckSpecFromBrief(brief: string): Promise<DeckSpec> {
+  if (process.env.DECKGRADER_MOCK_BEDROCK === '1') {
+    return {
+      deckTitle: '[mock] Deck from brief — set AWS credentials for real generation',
+      subtitle: brief.split(/\s+/).slice(0, 12).join(' '),
+      slides: [
+        {
+          title: '[mock] This placeholder deck was generated without AWS credentials',
+          bullets: [{ text: 'Run the server with real AWS credentials for actual generation.', level: 0 }],
+          notes: null,
+        },
+        {
+          title: '[mock] Recommendation: configure Bedrock access and regenerate',
+          bullets: [{ text: 'Set AWS_REGION and credentials, unset DECKGRADER_MOCK_BEDROCK.', level: 0 }],
+          notes: null,
+        },
+      ],
+    };
+  }
+  return generateSpec(
+    'Create a deck spec from this brief. Where the brief lacks specifics, structure the deck around the ' +
+      'decision it should drive and mark data points the author must fill in with [TODO: …] placeholders ' +
+      `rather than inventing numbers.\nBrief:\n${brief}`,
+  );
 }
